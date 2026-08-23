@@ -1,0 +1,23 @@
+# Hybrid workflow: deterministic skeleton, ONE bounded agent step for judgement.
+# The workflow decides WHAT happens and in what order; the agent decides HOW
+# to reason about the data it is handed. Run:
+#   python -m client.main workflow plan-my-day
+description: Gather facts deterministically, then let a scoped agent prioritise.
+steps:
+  - read: workspace://calendar/today
+    as: today
+
+  - tool: list_tasks
+    args: {status: open}
+    as: open_tasks
+
+  - agent: |
+      Here is today's calendar: {today}
+      Here are my open tasks: {open_tasks}
+      Recommend the single most important task to do first today, considering
+      due dates, priorities and free time between events. If a task deserves a
+      follow-up task, create it. Answer in at most 5 lines.
+    spec: task-assistant
+    as: plan
+
+output: "{plan}"

@@ -109,6 +109,42 @@ Read the three `agent*.py` files side by side: steps 1/3/4/5 (discover, intercep
 
 You'll see `[tool_use] …` / `[tool_result] …` lines as Claude discovers and calls tools, approval prompts for anything that writes, and an **audit trail** at the end.
 
+### User-defined workflows and agents (no Python required)
+
+Drop a YAML file into [`workflows/`](workflows/) and it becomes runnable — `workflow --list` shows everything:
+
+```yaml
+# workflows/morning-routine.yaml — fully deterministic, no LLM
+steps:
+  - read: workspace://calendar/today
+    as: today
+  - tool: list_tasks
+    args: {status: open, overdue_only: true}
+    as: overdue
+  - tool: send_email                    # [external] -> the gate asks for approval
+    args: {to: you@example.com, subject: "Brief {today.date}", body: "Overdue: {overdue}"}
+output: "Brief for {today.date} sent."
+```
+
+Three step kinds: `read:` (MCP resource), `tool:` (MCP tool, **through the approval gate**), and `agent:` (a bounded LLM step — the workflow decides *what/when*, the agent decides *how*). Results are named with `as:` and referenced with `{name}` / `{name.field}` / `{name.0}`; a whole-string placeholder keeps its type so `"{task.id}"` stays an integer. There is deliberately no if/else in the engine — deterministic control flow belongs to the author, judgement belongs in an `agent:` step. See [`workflows/plan-my-day.yaml`](workflows/plan-my-day.yaml) for the hybrid pattern.
+
+Agents are data too: a YAML file in [`agents/`](agents/) = persona + tool subset + model ("an agent is the generic loop plus a spec"):
+
+```yaml
+# agents/task-assistant.yaml
+system_prompt: |
+  You are the task assistant. You manage the user's task list and nothing else.
+allowed_tools: [list_tasks, add_task, complete_task]   # the model never sees the rest
+max_turns: 8
+```
+
+```powershell
+.venv\Scripts\python -m client.main agent --spec task-assistant "what should I do first today?"
+.venv\Scripts\python -m client.main workflow plan-my-day        # workflow invoking that spec
+```
+
+The engine ([`client/workflow_engine.py`](client/workflow_engine.py)) and spec loader ([`client/agent_specs.py`](client/agent_specs.py)) funnel every action through the same `ApprovalPolicy` — user-authored workflows inherit human-in-the-loop gating and the audit trail for free.
+
 ### Two transports, same code
 
 ```powershell
@@ -125,7 +161,7 @@ Default (`--transport stdio`) spawns the server as a child process and talks ove
 ### Tests
 
 ```powershell
-.venv\Scripts\python -m pytest -q     # 15 tests, in-memory client⇄server (seeded from tests/fixtures, so playing with the CLI can't break them)
+.venv\Scripts\python -m pytest -q     # 20 tests, in-memory client⇄server (seeded from tests/fixtures, so playing with the CLI can't break them)
 ```
 
 ---
@@ -141,7 +177,9 @@ Default (`--transport stdio`) spawns the server as a child process and talks ove
 | 5 | [`client/workflows.py`](client/workflows.py) | MCP used *from code*: resources, a write tool through the gate, and prompt+resources→single LLM call. |
 | 6 | [`client/agent.py`](client/agent.py) | The hand-written agent loop: discover → think → intercept → execute → feed back. |
 | 6b | [`client/agent_openai.py`](client/agent_openai.py), [`client/agent_gemini.py`](client/agent_gemini.py) | The same loop on other providers/local models — diff them against agent.py to see exactly what an LLM swap touches (only the think step). |
-| 7 | [`tests/test_workspace_mcp.py`](tests/test_workspace_mcp.py) | Every claim above, asserted. |
+| 7 | [`client/agent_specs.py`](client/agent_specs.py) | An "agent" as data: persona + tool subset + model. Users add agents via `agents/*.yaml`. |
+| 8 | [`client/workflow_engine.py`](client/workflow_engine.py) | User-defined YAML workflows: `read`/`tool`/`agent` steps, templating, gate-aware. |
+| 9 | [`tests/test_workspace_mcp.py`](tests/test_workspace_mcp.py) | Every claim above, asserted. |
 
 ---
 

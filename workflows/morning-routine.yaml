@@ -1,0 +1,24 @@
+# A fully deterministic user workflow: no LLM involved at all.
+# Run: python -m client.main workflow morning-routine
+description: Overdue check + today's calendar, e-mailed to yourself.
+steps:
+  - read: workspace://calendar/today
+    as: today
+
+  - tool: list_tasks
+    args: {status: open, overdue_only: true}
+    as: overdue
+
+  # send_email is annotated [external] -> the gate WILL ask for approval here
+  - tool: send_email
+    args:
+      to: info@astraq.ai
+      subject: "Morning brief for {today.date}"
+      body: |
+        Events today: {today.events}
+        Overdue tasks: {overdue}
+    as: sent
+
+output: |
+  Brief for {today.date} queued: {sent.status}
+  Overdue count piped through: {overdue}

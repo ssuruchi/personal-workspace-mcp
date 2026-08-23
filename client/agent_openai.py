@@ -28,6 +28,7 @@ import sys
 import openai
 from mcp import Client
 
+from .agent_specs import AgentSpec, compose_system_prompt, filter_tools_for_spec
 from .discovery import build_agent_system_prompt, mcp_tools_to_openai, tool_result_text
 from .gate import ApprovalPolicy
 
@@ -36,14 +37,16 @@ MAX_TURNS = 12
 
 
 async def run_agent(client: Client, policy: ApprovalPolicy, goal: str, *,
-                    model: str | None = None, verbose: bool = True) -> str:
-    model = model or os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
+                    model: str | None = None, verbose: bool = True,
+                    spec: AgentSpec | None = None) -> str:
+    model = model or (spec.model if spec else None) or os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
+    max_turns = spec.max_turns if spec else MAX_TURNS
 
     # 1. DISCOVER — identical to agent.py.
     tools = (await client.list_tools()).tools
-    policy.register_tools(tools)
-    oa_tools = mcp_tools_to_openai(tools)         # schema passthrough, different envelope
-    system = await build_agent_system_prompt(client)
+    policy.register_tools(tools)                  # gate sees all; model sees the spec's subset
+    oa_tools = mcp_tools_to_openai(filter_tools_for_spec(tools, spec))
+    system = compose_system_prompt(await build_agent_system_prompt(client), spec)
 
     # base_url from OPENAI_BASE_URL (env) makes this work with local servers.
     oa = openai.OpenAI()
@@ -52,7 +55,7 @@ async def run_agent(client: Client, policy: ApprovalPolicy, goal: str, *,
         {"role": "user", "content": goal},
     ]
 
-    for turn in range(1, MAX_TURNS + 1):
+    for turn in range(1, max_turns + 1):
         # 2. THINK
         response = oa.chat.completions.create(model=model, messages=messages, tools=oa_tools)
         msg = response.choices[0].message

@@ -28,6 +28,7 @@ from google import genai
 from google.genai import types as gt
 from mcp import Client
 
+from .agent_specs import AgentSpec, compose_system_prompt, filter_tools_for_spec
 from .discovery import build_agent_system_prompt, mcp_tools_to_gemini, tool_result_text
 from .gate import ApprovalPolicy
 
@@ -36,21 +37,23 @@ MAX_TURNS = 12
 
 
 async def run_agent(client: Client, policy: ApprovalPolicy, goal: str, *,
-                    model: str | None = None, verbose: bool = True) -> str:
-    model = model or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
+                    model: str | None = None, verbose: bool = True,
+                    spec: AgentSpec | None = None) -> str:
+    model = model or (spec.model if spec else None) or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
+    max_turns = spec.max_turns if spec else MAX_TURNS
 
     # 1. DISCOVER — identical to agent.py.
     tools = (await client.list_tools()).tools
-    policy.register_tools(tools)
+    policy.register_tools(tools)                  # gate sees all; model sees the spec's subset
     config = gt.GenerateContentConfig(
-        system_instruction=await build_agent_system_prompt(client),
-        tools=mcp_tools_to_gemini(tools),          # schema passthrough
+        system_instruction=compose_system_prompt(await build_agent_system_prompt(client), spec),
+        tools=mcp_tools_to_gemini(filter_tools_for_spec(tools, spec)),
     )
 
     g = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY from the environment
     contents: list[gt.Content] = [gt.Content(role="user", parts=[gt.Part.from_text(text=goal)])]
 
-    for turn in range(1, MAX_TURNS + 1):
+    for turn in range(1, max_turns + 1):
         # 2. THINK
         response = g.models.generate_content(model=model, contents=contents, config=config)
         candidate = response.candidates[0]

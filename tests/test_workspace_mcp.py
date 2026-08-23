@@ -248,3 +248,128 @@ async def test_tool_conversion_is_provider_neutral(server):
     genai_types = pytest.importorskip("google.genai.types")
     cfg = genai_types.GenerateContentConfig(system_instruction="s", tools=gemini_t)
     assert cfg.tools[0].function_declarations[0].name == tools[0].name
+
+
+# --------------------------------------------------------------------------- #
+# User-defined YAML workflows (client/workflow_engine.py) + AgentSpecs
+# --------------------------------------------------------------------------- #
+def _write_wf(tmp_path, text):
+    p = tmp_path / "wf.yaml"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+@pytest.mark.anyio
+async def test_yaml_workflow_read_tool_and_templating(server, tmp_path):
+    from client.workflow_engine import run_yaml_workflow
+
+    wf = _write_wf(tmp_path, """
+steps:
+  - read: workspace://calendar/today
+    as: today
+  - tool: list_tasks
+    args: {status: open, overdue_only: true}
+    as: overdue
+  - tool: add_task
+    args:
+      title: "Follow up: {overdue.0.title}"
+      due: "{today.date}"
+      priority: "{overdue.0.priority}"     # whole-string placeholder keeps type
+    as: created
+output: "created #{created.id} due {created.due}"
+""")
+    policy = ApprovalPolicy(auto_approve=True)
+    async with Client(server.mcp) as c:
+        policy.register_tools((await c.list_tools()).tools)
+        out = await run_yaml_workflow(c, policy, wf, verbose=False)
+    assert out == "created #5 due 2026-08-23"
+    tasks = json.loads((server.DATA / "tasks.json").read_text())
+    assert tasks[-1]["title"] == "Follow up: Draft Atlas migration plan"
+    assert tasks[-1]["priority"] == "high"
+
+
+@pytest.mark.anyio
+async def test_yaml_workflow_denied_write_stops_run(server, tmp_path):
+    from client.workflow_engine import WorkflowError, run_yaml_workflow
+
+    wf = _write_wf(tmp_path, """
+steps:
+  - tool: add_task
+    args: {title: nope, due: "2026-09-01"}
+""")
+    policy = ApprovalPolicy(auto_approve=False, interactive=False)
+    async with Client(server.mcp) as c:
+        policy.register_tools((await c.list_tools()).tools)
+        with pytest.raises(WorkflowError, match="DENIED"):
+            await run_yaml_workflow(c, policy, wf, verbose=False)
+    assert len(json.loads((server.DATA / "tasks.json").read_text())) == 4   # nothing written
+
+
+@pytest.mark.anyio
+async def test_yaml_workflow_agent_step_uses_spec_and_context(server, tmp_path, monkeypatch):
+    """The agent: step resolves a spec and receives templated context — the LLM
+    itself is stubbed out so the test needs no API key."""
+    import client.workflow_engine as eng
+
+    seen = {}
+
+    async def fake_run_agent(client, policy, goal, *, spec=None, verbose=True, model=None):
+        seen["goal"], seen["spec"] = goal, spec
+        return "do task 1 first"
+
+    monkeypatch.setattr(eng, "load_provider", lambda name: fake_run_agent)
+    wf = _write_wf(tmp_path, """
+steps:
+  - tool: list_tasks
+    args: {overdue_only: true}
+    as: overdue
+  - agent: "Prioritise: {overdue}"
+    spec: task-assistant
+    as: plan
+output: "{plan}"
+""")
+    policy = ApprovalPolicy(auto_approve=True)
+    async with Client(server.mcp) as c:
+        policy.register_tools((await c.list_tools()).tools)
+        out = await run_or(eng, c, policy, wf)
+    assert out == "do task 1 first"
+    assert "Draft Atlas migration plan" in seen["goal"]      # context was templated in
+    assert seen["spec"].name == "task-assistant"             # loaded from agents/*.yaml
+    assert seen["spec"].allowed_tools == ["list_tasks", "add_task", "complete_task"]
+
+
+async def run_or(eng, c, policy, wf):
+    return await eng.run_yaml_workflow(c, policy, wf, verbose=False)
+
+
+@pytest.mark.anyio
+async def test_yaml_workflow_bad_reference_fails_clearly(server, tmp_path):
+    from client.workflow_engine import WorkflowError, run_yaml_workflow
+
+    wf = _write_wf(tmp_path, """
+steps:
+  - tool: list_tasks
+    as: tasks
+output: "{tazks}"
+""")
+    policy = ApprovalPolicy(auto_approve=True)
+    async with Client(server.mcp) as c:
+        policy.register_tools((await c.list_tools()).tools)
+        with pytest.raises(WorkflowError, match="tazks"):
+            await run_yaml_workflow(c, policy, wf, verbose=False)
+
+
+@pytest.mark.anyio
+async def test_agent_spec_filters_tool_surface(server):
+    from client.agent_specs import filter_tools_for_spec, load_specs
+
+    specs = load_specs()
+    assert "generalist" in specs and "task-assistant" in specs and "notes-librarian" in specs
+    async with Client(server.mcp) as c:
+        tools = (await c.list_tools()).tools
+    filtered = filter_tools_for_spec(tools, specs["notes-librarian"])
+    assert {t.name for t in filtered} == {"search_notes", "create_note", "delete_note"}
+    assert len(filter_tools_for_spec(tools, specs["generalist"])) == len(tools)   # [] = all
+    with pytest.raises(SystemExit, match="doesn't have"):
+        from client.agent_specs import AgentSpec
+        filter_tools_for_spec(tools, AgentSpec(name="bad", allowed_tools=["launch_rockets"]))

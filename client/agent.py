@@ -32,6 +32,7 @@ from typing import Any
 import anthropic
 from mcp import Client
 
+from .agent_specs import AgentSpec, compose_system_prompt, filter_tools_for_spec
 from .discovery import build_agent_system_prompt, mcp_tools_to_anthropic, tool_result_text
 from .gate import ApprovalPolicy
 
@@ -40,19 +41,23 @@ MAX_TURNS = 12
 
 
 async def run_agent(client: Client, policy: ApprovalPolicy, goal: str, *,
-                    model: str | None = None, verbose: bool = True) -> str:
-    model = model or os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+                    model: str | None = None, verbose: bool = True,
+                    spec: AgentSpec | None = None) -> str:
+    # An AgentSpec specialises this generic loop: persona, tool subset, model, turn budget.
+    model = model or (spec.model if spec else None) or os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+    max_turns = spec.max_turns if spec else MAX_TURNS
 
     # 1. DISCOVER — ask the server what it can do, right now.
     tools = (await client.list_tools()).tools
-    policy.register_tools(tools)                  # gate needs the annotations
+    policy.register_tools(tools)                  # gate sees ALL tools (annotations)
+    tools = filter_tools_for_spec(tools, spec)    # the model sees only the spec's subset
     claude_tools = mcp_tools_to_anthropic(tools)  # schema passthrough
-    system = await build_agent_system_prompt(client)
+    system = compose_system_prompt(await build_agent_system_prompt(client), spec)
 
     anthropic_client = anthropic.Anthropic()
     messages: list[dict[str, Any]] = [{"role": "user", "content": goal}]
 
-    for turn in range(1, MAX_TURNS + 1):
+    for turn in range(1, max_turns + 1):
         # 2. THINK — one model call; Claude may answer or ask for tools.
         response = anthropic_client.beta.messages.create(
             model=model,
