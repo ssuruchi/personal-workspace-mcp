@@ -6,6 +6,7 @@ A small, complete **Model Context Protocol** setup you can read top to bottom:
 * an **MCP client** with three *workflows* and one *agent* (selectable brain: Claude, OpenAI, Gemini, or a local model) — [`client/`](client/)
 * tests that run the real protocol in memory — [`tests/`](tests/)
 * a line-by-line trace of one real agent run — [`docs/walkthrough.md`](docs/walkthrough.md)
+* what "harness", "agent", "config" and "workflow" actually mean — [`docs/concepts.md`](docs/concepts.md)
 
 Everything maps back to the ideas in the MCP write-up you read. The table at the bottom is the cheat-sheet.
 
