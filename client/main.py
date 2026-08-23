@@ -1,0 +1,149 @@
+"""
+CLI entry point for the MCP client.
+
+    python -m client.main inspect                         # what can the server do?
+    python -m client.main workflow daily-brief            # deterministic, no LLM
+    python -m client.main workflow capture-todos          # writes -> you will be asked
+    python -m client.main workflow weekly-review          # MCP prompt + resources -> Claude
+    python -m client.main agent "what's overdue? add a task to fix it"
+    python -m client.main agent --provider openai "..."   # or gemini; default anthropic
+
+Flags:
+    --transport stdio|http   (default stdio: spawns the server as a subprocess)
+    --url URL                (http only; default http://127.0.0.1:8000/mcp)
+    --yes                    auto-approve every write/destructive tool (no prompts)
+    --no-input               never prompt; deny anything that would need approval
+    --json                   (inspect) dump the raw self-description as JSON
+
+The agent's LLM is configurable (same MCP code, different "brain"):
+    --provider anthropic|openai|gemini   or env AGENT_PROVIDER (default anthropic)
+    --model NAME                         or env ANTHROPIC_MODEL / OPENAI_MODEL / GEMINI_MODEL
+Local models: --provider openai with OPENAI_BASE_URL pointing at Ollama/LM Studio/vLLM.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+
+from dotenv import load_dotenv
+
+from .connection import DEFAULT_HTTP_URL, connect
+from .discovery import describe_server, print_report
+from .gate import ApprovalPolicy
+from .workflows import WORKFLOWS
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="python -m client.main", description="Personal Workspace MCP client")
+    p.add_argument("--transport", choices=["stdio", "http"], default="stdio")
+    p.add_argument("--url", default=DEFAULT_HTTP_URL)
+    p.add_argument("--yes", action="store_true", help="auto-approve all tool calls")
+    p.add_argument("--no-input", action="store_true", help="never prompt; deny gated calls")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("inspect", help="print the server's self-description")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("-v", "--verbose", action="store_true")
+
+    w = sub.add_parser("workflow", help="run a code-orchestrated workflow")
+    w.add_argument("name", choices=sorted(WORKFLOWS))
+    w.add_argument("--focus", default="Project Atlas", help="(weekly-review) focus area")
+
+    a = sub.add_parser("agent", help="let an LLM pursue a goal using the server's tools")
+    a.add_argument("goal")
+    a.add_argument("--provider", choices=sorted(PROVIDERS),
+                   default=os.environ.get("AGENT_PROVIDER", "anthropic"))
+    a.add_argument("--model", default=None, help="override the provider's default model")
+    a.add_argument("-q", "--quiet", action="store_true")
+    return p
+
+
+# --------------------------------------------------------------------------- #
+# Provider registry. Imports are lazy so you only need the SDK (and key) of the
+# provider you actually pick. Each module exposes the same
+# `run_agent(client, policy, goal, model=..., verbose=...)` — the MCP side is
+# shared; only the "think" step differs. See agent*.py headers.
+# --------------------------------------------------------------------------- #
+PROVIDERS = {
+    "anthropic": {"module": ".agent", "keys": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+                  "hint": "set ANTHROPIC_API_KEY (or run `ant auth login`)"},
+    "openai": {"module": ".agent_openai", "keys": ["OPENAI_API_KEY"],
+               "hint": "set OPENAI_API_KEY (any non-empty value for a local OPENAI_BASE_URL server)"},
+    "gemini": {"module": ".agent_gemini", "keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+               "hint": "set GEMINI_API_KEY (or GOOGLE_API_KEY)"},
+}
+
+
+def load_provider(name: str):
+    import importlib
+    spec = PROVIDERS[name]
+    try:
+        module = importlib.import_module(spec["module"], package=__package__)
+    except ImportError as exc:
+        raise SystemExit(f"provider {name!r} needs its SDK installed: {exc}")
+    if not _has_credentials(name):
+        raise SystemExit(f"provider {name!r}: {spec['hint']}")
+    return module.run_agent
+
+
+async def amain(args: argparse.Namespace) -> int:
+    policy = ApprovalPolicy(auto_approve=args.yes, interactive=not args.no_input and sys.stdin.isatty())
+
+    # Resolve the LLM provider (SDK import + credential check) BEFORE opening
+    # the MCP session, so a missing key fails fast with a clean message.
+    run_agent = load_provider(args.provider) if args.cmd == "agent" else None
+
+    async with connect(policy, transport=args.transport, url=args.url) as client:
+        if args.cmd == "inspect":
+            desc = await describe_server(client)
+            if args.json:
+                print(json.dumps(desc, indent=2))
+            else:
+                print_report(desc, verbose=args.verbose)
+            return 0
+
+        # Both workflows and the agent need the tool annotations for the gate.
+        policy.register_tools((await client.list_tools()).tools)
+
+        if args.cmd == "workflow":
+            fn = WORKFLOWS[args.name]
+            kwargs = {"focus": args.focus} if args.name == "weekly-review" else {}
+            if args.name == "weekly-review" and not _has_credentials("anthropic"):
+                print("weekly-review calls Claude: set ANTHROPIC_API_KEY (or run `ant auth login`).", file=sys.stderr)
+                return 2
+            print(await fn(client, policy, **kwargs))
+            policy.print_audit()
+            return 0
+
+        if args.cmd == "agent":
+            print(f"[agent] provider={args.provider}", file=sys.stderr)
+            answer = await run_agent(client, policy, args.goal, model=args.model, verbose=not args.quiet)
+            print("\n── Answer ───────────────────────────────────────────────────")
+            print(answer)
+            policy.print_audit()
+            return 0
+    return 1
+
+
+def _has_credentials(provider: str) -> bool:
+    if any(os.environ.get(k) for k in PROVIDERS[provider]["keys"]):
+        return True
+    if provider == "anthropic":
+        # `ant auth login` profiles live here and are picked up by the SDK automatically.
+        cfg = os.path.expanduser("~/.config/anthropic")
+        return os.path.isdir(cfg) and any(os.scandir(cfg))
+    return False
+
+
+def main() -> None:
+    load_dotenv()  # optional .env with ANTHROPIC_API_KEY / WORKSPACE_TODAY
+    args = build_parser().parse_args()
+    raise SystemExit(asyncio.run(amain(args)))
+
+
+if __name__ == "__main__":
+    main()

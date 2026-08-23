@@ -1,0 +1,7 @@
+mcp>=2.0.0
+anthropic[mcp]>=1.0.0     # default agent provider (agent.py, weekly-review workflow)
+openai>=3.0.0             # optional: --provider openai, also local models via OPENAI_BASE_URL
+google-genai>=2.0.0       # optional: --provider gemini
+python-dotenv>=1.0
+pytest>=8
+pytest-asyncio>=0.23

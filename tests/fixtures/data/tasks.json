@@ -1,0 +1,6 @@
+[
+  {"id": 1, "title": "Draft Atlas migration plan", "due": "2026-08-22", "priority": "high", "done": false},
+  {"id": 2, "title": "Review PR #418", "due": "2026-08-23", "priority": "medium", "done": false},
+  {"id": 3, "title": "Book dentist appointment", "due": "2026-08-30", "priority": "low", "done": false},
+  {"id": 4, "title": "Renew domain astraq.ai", "due": "2026-08-20", "priority": "high", "done": true}
+]
